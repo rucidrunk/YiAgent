@@ -354,6 +354,7 @@ class ConversationStore:
         session_id: str,
         message: Dict[str, Any],
         channel_type: str = "",
+        user_id: str = "",
     ) -> int:
         """
         Append a message to the Redis context list.
@@ -391,7 +392,7 @@ class ConversationStore:
                 await self.upsert_meta(session_id, channel_type=channel_type)
 
             # Tracked background persist — failure is logged, never silently lost
-            _bg_tracker.spawn(self._persist_to_pg(session_id, [message], channel_type))
+            _bg_tracker.spawn(self._persist_to_pg(session_id, [message], channel_type, user_id))
 
             return base_seq + current_len + 1
         except Exception as e:
@@ -403,6 +404,7 @@ class ConversationStore:
         session_id: str,
         messages: List[Dict[str, Any]],
         channel_type: str = "",
+        user_id: str = "",
     ) -> Tuple[int, int]:
         """Append multiple messages in sequence.
 
@@ -414,7 +416,7 @@ class ConversationStore:
         total = len(messages)
         success = 0
         for msg in messages:
-            c = await self.append_message(session_id, msg, channel_type)
+            c = await self.append_message(session_id, msg, channel_type, user_id)
             if c > 0:
                 success += 1
             else:
@@ -533,13 +535,13 @@ class ConversationStore:
             return []
 
     async def _persist_to_pg(
-        self, session_id: str, messages: List[Dict[str, Any]], channel_type: str,
+        self, session_id: str, messages: List[Dict[str, Any]], channel_type: str, user_id: str = "",
     ) -> None:
         from yiagent.memory.long_term_store import get_long_term_store
         try:
             store = get_long_term_store()
             for msg in messages:
-                await store.append_message(session_id, msg, channel_type)
+                await store.append_message(session_id, msg, channel_type, user_id)
         except Exception as e:
             logger.warning(f"[ConvStore] PG persist failed for {session_id}: {e}")
 

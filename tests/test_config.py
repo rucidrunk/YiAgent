@@ -106,12 +106,17 @@ class TestConfigEnvVars:
         # Falls back to raw string when JSON parse fails
         assert cfg["agent_name"] == '{"broken"'
 
-    def test_env_var_not_in_defaults_is_ignored(self, monkeypatch):
-        monkeypatch.setenv("YIAGENT_UNKNOWN_KEY", "value")
-        import yiagent.common.config as cfg_mod
-        cfg_mod._config = None
-        cfg = load_config()
-        assert "unknown_key" not in cfg
+    def test_env_var_not_in_defaults_is_included(self):
+        """FIX VERIFIED: Any YIAGENT_* env var is now included, not just defaults."""
+        import os
+        os.environ["YIAGENT_CUSTOM_FIELD"] = "custom_value"
+        try:
+            import yiagent.common.config as cfg_mod
+            cfg_mod._config = None
+            cfg = load_config()
+            assert "custom_field" in cfg
+        finally:
+            del os.environ["YIAGENT_CUSTOM_FIELD"]
 
     def test_yiagent_config_env_var_points_to_file(self, monkeypatch):
         tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)

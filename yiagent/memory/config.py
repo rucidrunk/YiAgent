@@ -27,7 +27,7 @@ class MemoryConfig:
 
     # Search
     max_results: int = 10
-    min_score: float = 0.1
+    min_score: float = 0.005  # tuned for RRF fusion scores (max ~0.03 per channel)
     rrf_k: int = 60
     temporal_half_life_days: float = 30.0
 

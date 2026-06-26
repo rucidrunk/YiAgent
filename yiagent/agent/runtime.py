@@ -141,12 +141,16 @@ class AgentRuntime:
             raise SessionBusyError(self.session_id)
 
         try:
-            # 2. Load context from Redis
+            # 2. Load context from Redis — keep in-memory messages if Redis is down
             async with self._messages_lock:
-                self.messages = await store.load_context(
+                loaded = await store.load_context(
                     self.session_id,
                     max_turns=self.max_context_turns,
                 )
+                # Only replace if Redis actually returned data; otherwise preserve
+                # in-memory context so the agent remembers this session's history.
+                if loaded:
+                    self.messages = loaded
                 original_length = len(self.messages)
 
             # 3. Append user message
@@ -189,7 +193,10 @@ class AgentRuntime:
             if new_msgs:
                 from yiagent.memory.conversation_store import _bg_tracker
                 _bg_tracker.spawn(
-                    store.append_messages_batch(self.session_id, new_msgs, message.channel_type or "")
+                    store.append_messages_batch(
+                        self.session_id, new_msgs, message.channel_type or "",
+                        message.user_id or "",
+                    )
                 )
 
             # 8. Context pressure check (tracked background task)
@@ -387,8 +394,8 @@ class AgentStreamExecutor:
             await self._emit("error", {"error": "cancelled"})
 
         except Exception as e:
-            logger.error(f"[Agent] Execution error: {e}")
-            await self._emit("error", {"error": str(e)})
+            logger.error(f"[Agent] Execution error: {e!r}", exc_info=True)
+            await self._emit("error", {"error": f"{type(e).__name__}: {e}"})
             raise
 
         finally:
@@ -463,8 +470,11 @@ class AgentStreamExecutor:
             raise
         except Exception as e:
             error_str = str(e).lower()
+            error_type = type(e).__name__.lower()
             is_retryable = any(kw in error_str for kw in [
-                "timeout", "connection", "rate limit", "overloaded", "429", "500", "502", "503",
+                "timeout", "connection", "connect", "rate limit", "overloaded", "429", "500", "502", "503",
+            ]) or any(kw in error_type for kw in [
+                "timeout", "connect", "read", "write", "remote",
             ])
             if is_retryable and retry_count < max_retries:
                 wait = (retry_count + 1) * 2
@@ -571,14 +581,12 @@ class AgentStreamExecutor:
 
     def _check_consecutive_failures(self, tool_name: str, args: Dict) -> Tuple[bool, str, bool]:
         args_hash = hashlib.md5(json.dumps(args, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:8]
-        # Same args count
-        same = sum(1 for n, h, _ in reversed(self.tool_failure_history[-10:])
-                   if n == tool_name and h == args_hash)
+        # deque doesn't support slicing — convert to list for the last 10
+        recent = list(self.tool_failure_history)[-10:]
+        same = sum(1 for n, h, _ in reversed(recent) if n == tool_name and h == args_hash)
         if same >= 5:
             return (True, f"Tool '{tool_name}' called {same} times with same args — stopping loop", False)
-        # Failures
-        fails = sum(1 for n, h, s in reversed(self.tool_failure_history[-10:])
-                    if n == tool_name and not s)
+        fails = sum(1 for n, h, s in reversed(recent) if n == tool_name and not s)
         if fails >= 8:
             return (True, "Too many consecutive failures — aborting", True)
         if fails >= 3:

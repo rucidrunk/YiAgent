@@ -111,6 +111,13 @@ async def _get_or_create_agent(session_id: str):
     model.channel_type = "web"
 
     tm = ToolManager()
+    # Register built-in tools
+    from yiagent.agent.tools.builtin.memory_tools import (
+        MemorySearchTool, MemoryGetTool, MemoryAddTool,
+    )
+    tm.register_tool(MemorySearchTool)
+    tm.register_tool(MemoryGetTool)
+    tm.register_tool(MemoryAddTool)
     tm.load_mcp_tools()
     tools = tm.create_all_instances()
 
@@ -281,8 +288,8 @@ async def chat_stream(request: Request):
         except asyncio.CancelledError:
             task.cancel()
         except Exception as e:
-            logger.error(f"[SSE] Stream error: {e}")
-            data = json.dumps({"type": "agent_error", "message": str(e)}, ensure_ascii=False)
+            logger.error(f"[SSE] Stream error: {e!r}", exc_info=True)
+            data = json.dumps({"type": "agent_error", "message": f"{type(e).__name__}: {e}"}, ensure_ascii=False)
             yield f"event: agent_error\ndata: {data}\n\n"
 
     return StreamingResponse(
@@ -370,18 +377,9 @@ async function send() {
         document.getElementById("messages").scrollTop = document.getElementById("messages").scrollHeight;
     });
 
-    es.addEventListener("reasoning_update", e => {
-        const d = JSON.parse(e.data);
-        currentMsg.textContent += "[thinking] " + d.delta + " ";
-        document.getElementById("messages").scrollTop = document.getElementById("messages").scrollHeight;
-    });
-
     es.addEventListener("tool_end", e => {
-        const d = JSON.parse(e.data);
-        const tool = document.createElement("div");
-        tool.className = "tool";
-        tool.textContent = `[${d.status}] ${d.tool}`;
-        currentMsg.appendChild(tool);
+        // Show subtle activity indicator only — don't expose internal tool status to user
+        document.getElementById("status").textContent = "working…";
     });
 
     es.addEventListener("done", e => {

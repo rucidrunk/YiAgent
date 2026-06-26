@@ -80,18 +80,21 @@ class EmbeddingCache:
         return None
 
     async def put(self, provider: str, model: str, text: str, embedding: List[float]) -> None:
+        import json
         key = self._key(provider, model, text)
         self._cache[key] = embedding
+
+        evicted_key: Optional[str] = None
         if len(self._cache) > self._maxsize:
-            self._cache.popitem(last=False)
-        # Async write to Redis
+            evicted_key, _ = self._cache.popitem(last=False)
+
         try:
             r = await get_redis()
-            import json
-            await r.hset(
-                f"embed_cache:{provider}:{model}", key,
-                json.dumps(embedding, ensure_ascii=False),
-            )
+            redis_key = f"embed_cache:{provider}:{model}"
+            await r.hset(redis_key, key, json.dumps(embedding, ensure_ascii=False))
+            # Sync eviction to Redis so the stale entry isn't pulled back on next get()
+            if evicted_key is not None:
+                await r.hdel(redis_key, evicted_key)
         except Exception:
             pass
 
@@ -151,12 +154,12 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
 # Factory
 # ---------------------------------------------------------------------------
 
-_provider_registry: Dict[str, Type[EmbeddingProvider]] = {
+_provider_registry: Dict[str, type] = {
     "openai": OpenAIEmbeddingProvider,
 }
 
 
-def register_embedding_provider(name: str, cls: Type[EmbeddingProvider]) -> None:
+def register_embedding_provider(name: str, cls: type) -> None:
     """Register a custom embedding provider."""
     _provider_registry[name] = cls
 
@@ -166,7 +169,14 @@ def create_embedding_provider(provider_name: Optional[str] = None, **kwargs) -> 
     name = provider_name or conf().get("embedding_provider", "openai")
     if not name or name == "disabled":
         return None
-    cls = _provider_registry.get(name)
+
+    # Lazy import for dashscope to avoid hard dependency
+    if name == "dashscope":
+        from yiagent.memory.embedding.vendors.dashscope import DashScopeEmbeddingProvider
+        cls = DashScopeEmbeddingProvider
+    else:
+        cls = _provider_registry.get(name)
+
     if cls is None:
         logger.warning(f"[Embedding] Unknown provider '{name}', embedding disabled")
         return None

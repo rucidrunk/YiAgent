@@ -66,9 +66,12 @@ class ModelRouter:
     @staticmethod
     def _is_retryable(exc: Exception) -> bool:
         msg = str(exc).lower()
+        etype = type(exc).__name__.lower()
         return any(kw in msg for kw in (
-            "timeout", "connection", "rate limit", "overloaded",
+            "timeout", "connection", "connect", "rate limit", "overloaded",
             "429", "500", "502", "503", "504",
+        )) or any(kw in etype for kw in (
+            "timeout", "connect", "read", "write", "remote",
         ))
 
 

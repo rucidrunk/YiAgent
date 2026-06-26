@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -83,6 +84,9 @@ class MemoryManager:
             llm_model=llm_model,
         )
 
+        # File watcher (lazy start in initialize())
+        self._watcher: Any = None
+
         self._dirty = False
         self._initialized = False
         self._init_lock = asyncio.Lock()
@@ -98,14 +102,24 @@ class MemoryManager:
             if self._embedding_provider is None:
                 self._embedding_provider = create_embedding_provider()
             self._ensure_workspace()
+
+            # Start file watcher — auto-digest new .md files into memory_chunks
+            self._start_file_watcher()
+
+            # Initial sync: catch files that landed while we were offline
+            asyncio.create_task(self.sync_files(force=False))
+
             await self._flush_pipeline.start()
             self._initialized = True
             logger.info(
                 f"[MemoryManager] Initialized "
-                f"(embedding={'enabled' if self._embedding_provider else 'disabled'})"
+                f"(embedding={'enabled' if self._embedding_provider else 'disabled'}, "
+                f"watcher={'on' if self._watcher and self._watcher._running else 'off'})"
             )
 
     async def close(self) -> None:
+        if self._watcher:
+            self._watcher.stop()
         await self._flush_pipeline.stop()
         await self._long_term.close()
 
@@ -116,6 +130,39 @@ class MemoryManager:
         mem_md = ws / "MEMORY.md"
         if not mem_md.exists():
             mem_md.write_text("# Memory Index\n\n", encoding="utf-8")
+
+    def _start_file_watcher(self) -> None:
+        """Start a watchdog observer that auto-syncs .md files into memory_chunks."""
+        from yiagent.memory.file_watcher import MemoryFileWatcher
+
+        ws = str(self.config.get_workspace())
+
+        # Debounce interval: wait this many seconds of quiet before digesting
+        cooldown = conf().get("memory_watch_cooldown", 5.0)
+
+        def on_changed(filepath: str):
+            """Called from watchdog thread when a .md file changes."""
+            async def _digest():
+                from yiagent.common.log import logger as _log
+                _log.info(f"[MemoryManager] File watcher triggered by: {filepath}")
+                try:
+                    result = await self.sync_files(force=False)
+                    if result.get("files_changed", 0) > 0:
+                        _log.info(
+                            f"[MemoryManager] Auto-sync: {result['files_changed']} files, "
+                            f"{result['chunks_updated']} chunks"
+                        )
+                except Exception as e:
+                    _log.error(f"[MemoryManager] Auto-sync failed: {e}")
+
+            self._watcher.schedule_async(_digest())
+
+        self._watcher = MemoryFileWatcher(
+            workspace_dir=ws,
+            on_changed=on_changed,
+            cooldown=cooldown,
+        )
+        self._watcher.start()
 
     # ------------------------------------------------------------------
     # Search (hybrid: vector + keyword, RRF fusion)
@@ -294,7 +341,6 @@ class MemoryManager:
                     files_to_scan.append((file_path, "memory", "shared", None))
 
         # Pass 1: detect changes
-        import time as _time
         pending: List[Dict[str, Any]] = []
         for file_path, source, scope, uid in files_to_scan:
             try:

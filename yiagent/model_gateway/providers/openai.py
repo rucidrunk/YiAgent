@@ -42,7 +42,7 @@ class OpenAIProvider(LLMModel):
                     "Authorization": f"Bearer {self._api_key}",
                     "Content-Type": "application/json",
                 },
-                timeout=httpx.Timeout(connect=10.0, read=120.0, write=30.0, pool=10.0),
+                timeout=httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=10.0),
             )
         return self._client
 
@@ -92,9 +92,10 @@ class OpenAIProvider(LLMModel):
         body: Dict[str, Any] = {
             "model": self.model,
             "messages": self._format_messages(request),
-            "temperature": request.temperature,
             "stream": stream,
         }
+        if request.temperature is not None:
+            body["temperature"] = request.temperature
         if request.max_tokens:
             body["max_tokens"] = request.max_tokens
         if request.tools:
@@ -102,18 +103,82 @@ class OpenAIProvider(LLMModel):
                 {"type": "function", "function": t} if "type" not in t else t
                 for t in request.tools
             ]
-        # Pass extra provider-specific params
         body.update(request.extra)
         return body
 
     def _format_messages(self, request: LLMRequest) -> List[Dict[str, Any]]:
-        """Format messages for OpenAI API, injecting system prompt at front."""
+        """Format messages for OpenAI API — converts Claude content blocks to OpenAI format."""
         msgs = list(request.messages)
+        converted = []
+        for msg in msgs:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "assistant" and isinstance(content, list):
+                text_parts = []
+                tool_calls = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif block.get("type") == "tool_use":
+                            args = block.get("input", {})
+                            tool_calls.append({
+                                "id": block.get("id", ""),
+                                "type": "function",
+                                "function": {
+                                    "name": block.get("name", ""),
+                                    "arguments": json.dumps(args, ensure_ascii=False),
+                                },
+                            })
+                        elif block.get("type") == "thinking":
+                            pass  # OpenAI doesn't render thinking blocks
+                entry = {"role": "assistant", "content": "\n".join(text_parts) or None}
+                if tool_calls:
+                    entry["tool_calls"] = tool_calls
+                converted.append(entry)
+
+            elif role == "user" and isinstance(content, list):
+                text_parts = []
+                tool_results = []
+                for block in content:
+                    if isinstance(block, dict):
+                        if block.get("type") == "text":
+                            text_parts.append(block.get("text", ""))
+                        elif block.get("type") == "tool_result":
+                            converted.append({
+                                "role": "tool",
+                                "tool_call_id": block.get("tool_use_id", ""),
+                                "content": block.get("content", ""),
+                            })
+                if text_parts:
+                    converted.append({"role": "user", "content": "\n".join(text_parts)})
+                # tool_result blocks were already appended individually above
+
+            elif role == "system":
+                converted.append({"role": "system", "content": _extract_text(content)})
+            else:
+                converted.append({"role": role, "content": _extract_text(content)})
+
         if request.system:
-            msgs.insert(0, {"role": "system", "content": request.system})
-        return msgs
+            converted.insert(0, {"role": "system", "content": request.system})
+
+        return converted
 
     async def close(self) -> None:
         if self._client:
             await self._client.aclose()
             self._client = None
+
+
+def _extract_text(content) -> str:
+    """Extract plain text from message content (str or list of blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+        return "\n".join(parts)
+    return str(content) if content else ""

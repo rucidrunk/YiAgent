@@ -53,7 +53,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_active TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     msg_count INTEGER NOT NULL DEFAULT 0,
-    metadata JSONB DEFAULT '{}'::jsonb
+    metadata JSONB DEFAULT '{{}}'::jsonb
 );
 
 -- Messages (archival)
@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS messages (
     content JSONB NOT NULL,
     token_estimate INTEGER DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    extras JSONB DEFAULT '{}'::jsonb,
+    extras JSONB DEFAULT '{{}}'::jsonb,
     PRIMARY KEY (conversation_id, seq)
 );
 
@@ -79,9 +79,9 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
     start_line INTEGER NOT NULL DEFAULT 0,
     end_line INTEGER NOT NULL DEFAULT 0,
     text TEXT NOT NULL,
-    embedding vector(1536),
+    embedding vector({dim}),
     content_hash VARCHAR(64) NOT NULL,
-    metadata JSONB DEFAULT '{}'::jsonb,
+    metadata JSONB DEFAULT '{{}}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -208,9 +208,11 @@ class LongTermStore:
         if self._initialized:
             return
         pool = await self._get_pool()
+        dim = conf().get("pg_vector_dim", 1536)
+        ddl = PG_SCHEMA_DDL.format(dim=dim)
         async with pool.acquire() as conn:
             # Execute DDL block-by-block for safety
-            for stmt in PG_SCHEMA_DDL.split(";"):
+            for stmt in ddl.split(";"):
                 stmt = stmt.strip()
                 if stmt:
                     try:
@@ -218,7 +220,7 @@ class LongTermStore:
                     except Exception as e:
                         logger.warning(f"[LongTermStore] DDL skip: {e}")
         self._initialized = True
-        logger.info("[LongTermStore] Schema initialized")
+        logger.info(f"[LongTermStore] Schema initialized (vector dim={dim})")
 
     async def close(self) -> None:
         if self._pool:
@@ -230,7 +232,7 @@ class LongTermStore:
     # ------------------------------------------------------------------
 
     async def append_message(
-        self, session_id: str, message: Dict[str, Any], channel_type: str = ""
+        self, session_id: str, message: Dict[str, Any], channel_type: str = "", user_id: str = "",
     ) -> None:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
@@ -238,14 +240,15 @@ class LongTermStore:
                 # Upsert conversation
                 await conn.execute(
                     """
-                    INSERT INTO conversations (session_id, channel_type, last_active, msg_count)
-                    VALUES ($1, $2, NOW(), 1)
+                    INSERT INTO conversations (session_id, channel_type, user_id, last_active, msg_count)
+                    VALUES ($1, $2, $3, NOW(), 1)
                     ON CONFLICT (session_id) DO UPDATE
                         SET last_active = NOW(),
                             msg_count = conversations.msg_count + 1,
-                            channel_type = COALESCE(NULLIF($2, ''), conversations.channel_type)
+                            channel_type = COALESCE(NULLIF($2, ''), conversations.channel_type),
+                            user_id = COALESCE(NULLIF($3, ''), conversations.user_id)
                     """,
-                    session_id, channel_type,
+                    session_id, channel_type, user_id,
                 )
 
                 # Get conversation UUID
@@ -256,7 +259,9 @@ class LongTermStore:
                 seq = message.get("seq", 0)
                 role = message.get("role", "")
                 content = message.get("content", "")
-                if isinstance(content, list):
+                if isinstance(content, (list, dict)):
+                    content = json.dumps(content, ensure_ascii=False)
+                elif isinstance(content, str):
                     content = json.dumps(content, ensure_ascii=False)
                 extras = message.get("extras", {})
 
@@ -419,7 +424,9 @@ class LongTermStore:
             if user_id:
                 scopes.append("user")
 
-        vec_str = _encode_vector_str(query_embedding)
+        vec_str = _encode_vector(query_embedding)
+        if vec_str is None:
+            return []  # embedding was invalid (NaN/Inf)
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             scope_placeholders = ", ".join(f"${i+2}" for i in range(len(scopes)))
@@ -668,14 +675,22 @@ class LongTermStore:
 # ---------------------------------------------------------------------------
 
 def _encode_vector(vec: Optional[List[float]]) -> Optional[str]:
-    """Encode a float list to pgvector-compatible string."""
+    """Encode a float list to pgvector-compatible string.
+
+    Rejects NaN/Inf values which pgvector refuses to parse. A single
+    bad vector would otherwise cause the entire batch INSERT to fail.
+    """
     if vec is None:
+        return None
+    if not _validate_vector(vec):
         return None
     return "[" + ",".join(str(v) for v in vec) + "]"
 
 
-def _encode_vector_str(vec: List[float]) -> str:
-    return "[" + ",".join(str(v) for v in vec) + "]"
+def _validate_vector(vec: List[float]) -> bool:
+    """Return True if all values are finite real numbers."""
+    import math
+    return all(math.isfinite(v) for v in vec)
 
 
 def _trunc_text(text: str, max_chars: int) -> str:

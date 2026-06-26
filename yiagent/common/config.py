@@ -50,7 +50,7 @@ _DEFAULT_CONFIG: Dict[str, Any] = {
 
     # --- Hybrid search ---
     "rrf_k": 60,                       # RRF constant
-    "min_score": 0.1,
+    "min_score": 0.005,
     "max_results": 10,
     "temporal_half_life_days": 30.0,
 

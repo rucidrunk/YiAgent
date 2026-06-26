@@ -104,8 +104,8 @@ class SkillManager:
                 "category": prev.get("category", "skill"),
             }
 
+        self.skills_config = merged
         if merged != saved:
-            self.skills_config = merged
             self._save_config_file()
 
     def is_skill_enabled(self, name: str) -> bool:
